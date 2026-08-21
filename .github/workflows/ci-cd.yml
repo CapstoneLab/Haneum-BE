@@ -1,0 +1,145 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keyback-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Run tests
+        run: pytest
+
+      - name: Validate Docker Compose
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          ANDROID_API_KEY: ci-only-android-api-key
+          INTERNAL_API_KEY: ci-only-internal-api-key
+        run: cp .env.example .env && docker compose config --quiet
+
+  deploy:
+    name: Deploy to Raspberry Pi
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.RASPI_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.RASPI_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Package source
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=.github \
+            --exclude=.env \
+            --exclude=.venv \
+            --exclude='.venv-*' \
+            --exclude=.pytest_cache \
+            --exclude=.ruff_cache \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            -czf /tmp/keyback-${GITHUB_SHA}.tar.gz .
+
+      - name: Upload release
+        env:
+          DEPLOY_HOST: ${{ secrets.RASPI_HOST }}
+          DEPLOY_PORT: ${{ secrets.RASPI_PORT }}
+          DEPLOY_USER: ${{ secrets.RASPI_USER }}
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p \"\$HOME/keyback/releases/$GITHUB_SHA\" \"\$HOME/keyback/shared\""
+          scp -P "$DEPLOY_PORT" /tmp/keyback-${GITHUB_SHA}.tar.gz \
+            "$DEPLOY_USER@$DEPLOY_HOST:keyback/releases/$GITHUB_SHA/source.tar.gz"
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "tar -xzf \"\$HOME/keyback/releases/$GITHUB_SHA/source.tar.gz\" -C \"\$HOME/keyback/releases/$GITHUB_SHA\" && rm \"\$HOME/keyback/releases/$GITHUB_SHA/source.tar.gz\""
+
+      - name: Install production environment
+        env:
+          DEPLOY_HOST: ${{ secrets.RASPI_HOST }}
+          DEPLOY_PORT: ${{ secrets.RASPI_PORT }}
+          DEPLOY_USER: ${{ secrets.RASPI_USER }}
+          PRODUCTION_ENV_FILE: ${{ secrets.PRODUCTION_ENV_FILE }}
+        run: |
+          printf '%s\n' "$PRODUCTION_ENV_FILE" | \
+            ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "umask 077; cat > \"\$HOME/keyback/shared/.env\""
+
+      - name: Start containers and verify health
+        env:
+          DEPLOY_HOST: ${{ secrets.RASPI_HOST }}
+          DEPLOY_PORT: ${{ secrets.RASPI_PORT }}
+          DEPLOY_USER: ${{ secrets.RASPI_USER }}
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -se' <<EOF
+            set -Eeuo pipefail
+            release_dir="\$HOME/keyback/releases/$GITHUB_SHA"
+            previous_release="\$(readlink -f "\$HOME/keyback/current" 2>/dev/null || true)"
+            cp "\$HOME/keyback/shared/.env" "\$release_dir/.env"
+            chmod 600 "\$release_dir/.env"
+            cd "\$release_dir"
+            IMAGE_TAG="$GITHUB_SHA" docker compose --project-name keyback build --pull
+            IMAGE_TAG="$GITHUB_SHA" docker compose --project-name keyback up -d --remove-orphans
+
+            container_id="\$(IMAGE_TAG="$GITHUB_SHA" docker compose --project-name keyback ps -q backend)"
+            for attempt in \$(seq 1 24); do
+              status="\$(docker inspect --format '{{.State.Health.Status}}' "\$container_id" 2>/dev/null || true)"
+              if [ "\$status" = healthy ]; then
+                ln -sfn "\$release_dir" "\$HOME/keyback/current"
+                docker image prune -f
+                exit 0
+              fi
+              if [ "\$status" = unhealthy ]; then
+                break
+              fi
+              sleep 5
+            done
+
+            IMAGE_TAG="$GITHUB_SHA" docker compose --project-name keyback ps
+            IMAGE_TAG="$GITHUB_SHA" docker compose --project-name keyback logs --tail=100 backend
+
+            if [ -n "\$previous_release" ] && [ -f "\$previous_release/docker-compose.yml" ]; then
+              previous_tag="\$(basename "\$previous_release")"
+              cd "\$previous_release"
+              IMAGE_TAG="\$previous_tag" docker compose --project-name keyback up -d --remove-orphans
+              echo "Deployment failed; rolled back to \$previous_tag" >&2
+            fi
+            exit 1
+          EOF

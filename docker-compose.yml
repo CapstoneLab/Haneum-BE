@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-keyback}
+      POSTGRES_USER: ${POSTGRES_USER:-keyback}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-keyback} -d ${POSTGRES_DB:-keyback}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    image: keyback-backend:${IMAGE_TAG:-latest}
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-keyback}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-keyback}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 20s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8000/api/v1/health',headers={'X-API-Key':os.environ['ANDROID_API_KEY']}); urllib.request.urlopen(r,timeout=2)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  postgres_data:
