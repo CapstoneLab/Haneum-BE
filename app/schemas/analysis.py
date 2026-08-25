@@ -4,7 +4,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.core.constants import RISK_TYPES, RecommendedAction, RiskLevel
+from app.core.constants import (
+    RISK_TYPES,
+    ConversationRiskStatus,
+    RecommendedAction,
+    RiskLevel,
+)
 
 
 class ContextMessage(BaseModel):
@@ -30,6 +35,8 @@ class AnalyzeRequest(BaseModel):
     request_id: uuid.UUID
     device_id: str = Field(min_length=1, max_length=100)
     app_package: str | None = Field(default=None, max_length=150)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=150)
+    message_id: str | None = Field(default=None, min_length=1, max_length=100)
     input_text: str = Field(min_length=1, max_length=1000)
     masked_text: str = Field(min_length=1, max_length=1000)
     context_messages: list[ContextMessage] = Field(default_factory=list, max_length=5)
@@ -51,6 +58,16 @@ class AnalysisSource(BaseModel):
     fallback_used: bool
 
 
+class ConversationRiskData(BaseModel):
+    conversation_id: str | None
+    status: ConversationRiskStatus
+    previous_status: ConversationRiskStatus
+    changed: bool
+    latched: bool
+    suspicion_count: int = Field(ge=0)
+    peak_score: int = Field(ge=0, le=100)
+
+
 class ScoreBreakdown(BaseModel):
     local_score: int = Field(ge=0, le=100)
     rule_score: int = Field(ge=0, le=100)
@@ -66,6 +83,7 @@ class AnalyzeResponseData(BaseModel):
     reason: str = Field(max_length=150)
     recommended_action: RecommendedAction
     analysis_source: AnalysisSource
+    conversation_risk: ConversationRiskData | None = None
     scores: ScoreBreakdown
     processing_time_ms: int = Field(ge=0)
     server_timestamp: datetime

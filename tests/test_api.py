@@ -168,6 +168,122 @@ async def test_llm_failure_uses_rule_fallback(client, auth_headers, monkeypatch)
     assert data["risk_level"] == "danger"
 
 
+async def test_conversation_risk_watches_confirms_and_stays_latched(
+    client, auth_headers, monkeypatch
+) -> None:
+    llm_scores = iter([45, 45, 0, 0])
+
+    async def fake_analyze(self, payload):
+        score = next(llm_scores)
+        return LlmAnalyzeData(
+            request_id=payload.request_id,
+            risk_score=score,
+            risk_types=["institution_impersonation"] if score else [],
+            confidence=0.9,
+            reason=(
+                "기관 사칭 가능성이 있어 대화 문맥을 계속 확인해야 합니다."
+                if score
+                else "현재 문장에서는 새로운 위험 신호가 없습니다."
+            ),
+            model=LlmModelInfo(name="test", version="1", runtime="test"),
+            processing_time_ms=10,
+        )
+
+    monkeypatch.setattr(LlmClient, "analyze", fake_analyze)
+
+    async def analyze(conversation_id: str, message_id: str) -> dict:
+        request_id = uuid.uuid4()
+        payload = _request_payload(request_id)
+        payload["conversation_id"] = conversation_id
+        payload["message_id"] = message_id
+        response = await client.post(
+            "/api/v1/analyze",
+            headers={**auth_headers, "X-Request-ID": str(request_id)},
+            json=payload,
+        )
+        assert response.status_code == 200
+        return response.json()["data"]["conversation_risk"]
+
+    first = await analyze("sms:01011112222", "message-1")
+    second = await analyze("sms:01011112222", "message-2")
+    after_confirmation = await analyze("sms:01011112222", "message-3")
+    separate_conversation = await analyze("sms:01099998888", "message-4")
+
+    assert first["status"] == "watching"
+    assert first["changed"] is True
+    assert second["status"] == "confirmed"
+    assert second["previous_status"] == "watching"
+    assert second["latched"] is True
+    assert after_confirmation["status"] == "confirmed"
+    assert after_confirmation["changed"] is False
+    assert separate_conversation["status"] == "normal"
+
+
+async def test_repeated_draft_does_not_count_as_multiple_suspicious_messages(
+    client, auth_headers, monkeypatch
+) -> None:
+    async def fake_analyze(self, payload):
+        return LlmAnalyzeData(
+            request_id=payload.request_id,
+            risk_score=45,
+            risk_types=["institution_impersonation"],
+            confidence=0.9,
+            reason="기관 사칭 가능성이 있습니다.",
+            model=LlmModelInfo(name="test", version="1", runtime="test"),
+            processing_time_ms=10,
+        )
+
+    monkeypatch.setattr(LlmClient, "analyze", fake_analyze)
+
+    states = []
+    for _ in range(2):
+        request_id = uuid.uuid4()
+        payload = _request_payload(request_id)
+        payload["conversation_id"] = "sms:01011112222"
+        payload["message_id"] = "same-draft"
+        response = await client.post(
+            "/api/v1/analyze",
+            headers={**auth_headers, "X-Request-ID": str(request_id)},
+            json=payload,
+        )
+        assert response.status_code == 200
+        states.append(response.json()["data"]["conversation_risk"])
+
+    assert [state["status"] for state in states] == ["watching", "watching"]
+    assert [state["suspicion_count"] for state in states] == [1, 1]
+
+
+async def test_sensitive_input_confirms_conversation_immediately(
+    client, auth_headers, monkeypatch
+) -> None:
+    async def fake_analyze(self, payload):
+        return LlmAnalyzeData(
+            request_id=payload.request_id,
+            risk_score=10,
+            risk_types=[],
+            confidence=0.9,
+            reason="추가 의미 분석 결과입니다.",
+            model=LlmModelInfo(name="test", version="1", runtime="test"),
+            processing_time_ms=10,
+        )
+
+    monkeypatch.setattr(LlmClient, "analyze", fake_analyze)
+    request_id = uuid.uuid4()
+    payload = _request_payload(request_id, dangerous=True)
+    payload["conversation_id"] = "sms:01011112222"
+
+    response = await client.post(
+        "/api/v1/analyze",
+        headers={**auth_headers, "X-Request-ID": str(request_id)},
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    state = response.json()["data"]["conversation_risk"]
+    assert state["status"] == "confirmed"
+    assert state["latched"] is True
+
+
 async def test_settings_round_trip(client, auth_headers) -> None:
     default_response = await client.get("/api/v1/settings/test-device", headers=auth_headers)
     assert default_response.status_code == 200

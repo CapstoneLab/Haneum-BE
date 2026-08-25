@@ -14,6 +14,7 @@ Claude 또는 Mac mini 로컬 LLM의 문맥 분석을 결합하는 FastAPI 백�
 - Claude Messages API 구조화 출력 클라이언트
 - 선택 가능한 Mac mini 내부 LLM 클라이언트
 - LLM 장애 fallback, 위험 점수 통합, 최소 점수 보정
+- 대화별 `normal → watching → confirmed` 위험 상태 누적과 확정 상태 유지
 - 원문 미저장과 서버 재마스킹
 - API Key 인증, 요청 크기·필드 제한, `request_id` 멱등 처리
 - Raspberry Pi용 Docker Compose
@@ -28,6 +29,34 @@ docker compose up --build
 ```
 
 API 문서는 개발 환경에서 `http://localhost:8000/docs`로 확인할 수 있습니다.
+
+## 실시간 대화 위험 상태
+
+Android는 분석 요청마다 같은 채팅방을 식별하는 `conversation_id`를 보내야 합니다. 입력 중
+debounce로 같은 문장을 여러 번 분석할 때는 동일한 `message_id`를 유지하고, 전송 완료 후 다음
+메시지부터 새 `message_id`를 사용합니다.
+
+```json
+{
+  "conversation_id": "sms:sha256:8f4c...",
+  "message_id": "draft-018f...",
+  "context_messages": [
+    {"speaker": "other", "text": "검찰 수사관입니다"},
+    {"speaker": "user", "text": "무슨 일인가요?"}
+  ]
+}
+```
+
+응답의 `conversation_risk.status`는 다음 의미입니다.
+
+- `normal`: 현재까지 뚜렷한 위험 신호 없음
+- `watching`: 의미상 의심 신호가 있어 계속 관찰
+- `confirmed`: 민감정보 또는 누적 고위험 신호 확인; 이후 안전한 단문이 와도 같은
+  `conversation_id`에서는 유지
+
+`conversation_id`를 생략한 기존 요청도 처리되지만 상태는 DB에 누적되지 않습니다.
+전화번호나 상대방 이름을 그대로 쓰지 말고 Android에서 안정적인 불투명 ID 또는 해시를
+만들어 전송해야 합니다.
 
 ## Android 터미널 시뮬레이터
 

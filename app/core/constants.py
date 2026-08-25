@@ -7,6 +7,12 @@ class RiskLevel(StrEnum):
     DANGER = "danger"
 
 
+class ConversationRiskStatus(StrEnum):
+    NORMAL = "normal"
+    WATCHING = "watching"
+    CONFIRMED = "confirmed"
+
+
 class UserAction(StrEnum):
     NONE = "none"
     CONTINUE = "continue"

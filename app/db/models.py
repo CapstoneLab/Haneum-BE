@@ -16,6 +16,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -51,6 +52,8 @@ class AnalysisRequest(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     device_id: Mapped[str] = mapped_column(String(100), nullable=False)
     app_name: Mapped[str | None] = mapped_column(String(150))
+    conversation_id: Mapped[str | None] = mapped_column(String(150))
+    message_id: Mapped[str | None] = mapped_column(String(100))
     masked_text: Mapped[str | None] = mapped_column(Text)
     local_score: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
     rule_score: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
@@ -89,6 +92,7 @@ class RiskLog(Base):
     )
     device_id: Mapped[str] = mapped_column(String(100), nullable=False)
     app_name: Mapped[str | None] = mapped_column(String(150))
+    conversation_id: Mapped[str | None] = mapped_column(String(150))
     risk_score: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
     risk_level: Mapped[str] = mapped_column(String(20), nullable=False, default="safe")
     risk_types: Mapped[list[str]] = mapped_column(json_type, nullable=False, default=list)
@@ -102,6 +106,44 @@ class RiskLog(Base):
     )
 
     analysis_request: Mapped[AnalysisRequest | None] = relationship(back_populates="risk_log")
+
+
+class ConversationRiskProfile(Base):
+    __tablename__ = "conversation_risk_profiles"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('normal','watching','confirmed')",
+            name="ck_conversation_risk_status",
+        ),
+        CheckConstraint("suspicion_count >= 0", name="ck_conversation_suspicion_count"),
+        CheckConstraint(
+            "peak_score BETWEEN 0 AND 100", name="ck_conversation_peak_score"
+        ),
+        UniqueConstraint(
+            "device_id", "conversation_id", name="uq_conversation_risk_device_conversation"
+        ),
+        Index("ix_conversation_risk_device_updated", "device_id", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True
+    )
+    device_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(150), nullable=False)
+    app_name: Mapped[str | None] = mapped_column(String(150))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="normal")
+    suspicion_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    peak_score: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
+    risk_types: Mapped[list[str]] = mapped_column(json_type, nullable=False, default=list)
+    last_suspicious_message_id: Mapped[str | None] = mapped_column(String(100))
+    last_reason: Mapped[str | None] = mapped_column(Text)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
 
 
 class UserSettings(Base):

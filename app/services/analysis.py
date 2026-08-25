@@ -7,17 +7,19 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.constants import AnalysisStatus, RiskLevel
+from app.core.constants import AnalysisStatus, ConversationRiskStatus, RiskLevel
 from app.core.errors import ApiError
 from app.db.models import AnalysisRequest as AnalysisRequestModel
-from app.db.models import RiskLog, UserSettings
+from app.db.models import ConversationRiskProfile, RiskLog, UserSettings
 from app.schemas.analysis import (
     AnalysisSource,
     AnalyzeRequest,
     AnalyzeResponseData,
+    ConversationRiskData,
     LlmAnalyzeRequest,
     ScoreBreakdown,
 )
+from app.services.conversation_risk import advance_conversation_risk
 from app.services.llm import LlmServiceError, create_llm_client
 from app.services.masking import MaskingError, mask_sensitive_texts, verify_and_mask
 from app.services.rules import analyze_rules
@@ -75,6 +77,82 @@ class AnalysisService:
             logger.exception("Could not load user sensitivity; using normal")
             return "normal"
 
+    def _advance_conversation_risk(
+        self,
+        *,
+        payload: AnalyzeRequest,
+        evidence_score: int,
+        risk_types: list[str],
+        reason: str,
+        completed_at: datetime,
+    ) -> ConversationRiskData:
+        profile: ConversationRiskProfile | None = None
+        if payload.conversation_id is not None:
+            try:
+                profile = self.db.scalar(
+                    select(ConversationRiskProfile)
+                    .where(
+                        ConversationRiskProfile.device_id == payload.device_id,
+                        ConversationRiskProfile.conversation_id == payload.conversation_id,
+                    )
+                    .with_for_update()
+                )
+            except SQLAlchemyError:
+                self.db.rollback()
+                logger.exception("Could not load conversation risk state")
+
+        previous_status = ConversationRiskStatus(
+            profile.status if profile is not None else ConversationRiskStatus.NORMAL
+        )
+        decision = advance_conversation_risk(
+            previous_status=previous_status,
+            previous_suspicion_count=profile.suspicion_count if profile is not None else 0,
+            previous_peak_score=profile.peak_score if profile is not None else 0,
+            previous_risk_types=profile.risk_types if profile is not None else [],
+            evidence_score=evidence_score,
+            current_risk_types=risk_types,
+            count_current_signal=(
+                payload.message_id is None
+                or profile is None
+                or profile.last_suspicious_message_id != payload.message_id
+            ),
+        )
+
+        if payload.conversation_id is not None:
+            if profile is None:
+                profile = ConversationRiskProfile(
+                    device_id=payload.device_id,
+                    conversation_id=payload.conversation_id,
+                )
+                self.db.add(profile)
+            profile.app_name = payload.app_package
+            profile.status = decision.status
+            profile.suspicion_count = decision.suspicion_count
+            profile.peak_score = decision.peak_score
+            profile.risk_types = decision.risk_types
+            if decision.signal_counted and payload.message_id is not None:
+                profile.last_suspicious_message_id = payload.message_id
+            profile.last_reason = reason[:150]
+            profile.updated_at = completed_at
+            if (
+                decision.status == ConversationRiskStatus.CONFIRMED
+                and profile.confirmed_at is None
+            ):
+                profile.confirmed_at = completed_at
+
+        return ConversationRiskData(
+            conversation_id=payload.conversation_id,
+            status=decision.status,
+            previous_status=previous_status,
+            changed=decision.status != previous_status,
+            latched=(
+                payload.conversation_id is not None
+                and decision.status == ConversationRiskStatus.CONFIRMED
+            ),
+            suspicion_count=decision.suspicion_count,
+            peak_score=decision.peak_score,
+        )
+
     async def analyze(self, payload: AnalyzeRequest) -> AnalyzeResponseData:
         started = time.perf_counter()
         existing = self._find_existing(payload)
@@ -90,6 +168,8 @@ class AnalysisService:
             id=payload.request_id,
             device_id=payload.device_id,
             app_name=payload.app_package,
+            conversation_id=payload.conversation_id,
+            message_id=payload.message_id,
             masked_text=masked_text,
             local_score=payload.local_detection.local_score,
             status=AnalysisStatus.PROCESSING,
@@ -154,6 +234,25 @@ class AnalysisService:
             reason = "감지된 위험 요소가 없습니다."
 
         completed_at = datetime.now(UTC)
+        llm_evidence_score = 0
+        if llm_data is not None:
+            llm_evidence_score = round(
+                llm_data.risk_score
+                * (llm_data.confidence if llm_data.confidence is not None else 1.0)
+            )
+        evidence_score = max(
+            score_result.score,
+            payload.local_detection.local_score,
+            rule_result.score,
+            llm_evidence_score,
+        )
+        conversation_risk = self._advance_conversation_risk(
+            payload=payload,
+            evidence_score=evidence_score,
+            risk_types=risk_types,
+            reason=reason,
+            completed_at=completed_at,
+        )
         response = AnalyzeResponseData(
             request_id=payload.request_id,
             risk_score=score_result.score,
@@ -167,6 +266,7 @@ class AnalysisService:
                 llm_used=llm_data is not None,
                 fallback_used=llm_data is None,
             ),
+            conversation_risk=conversation_risk,
             scores=ScoreBreakdown(
                 local_score=payload.local_detection.local_score,
                 rule_score=rule_result.score,
@@ -196,6 +296,7 @@ class AnalysisService:
                         analysis_request_id=payload.request_id,
                         device_id=payload.device_id,
                         app_name=payload.app_package,
+                        conversation_id=payload.conversation_id,
                         risk_score=score_result.score,
                         risk_level=score_result.level,
                         risk_types=risk_types,
