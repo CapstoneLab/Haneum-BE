@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     llm_provider: Literal["local", "claude"] = "claude"
     llm_base_url: str = "http://127.0.0.1:8001/internal/v1"
     llm_timeout_seconds: float = Field(default=8.0, gt=0, le=10)
+    llm_response_deadline_seconds: float = Field(default=1.5, gt=0, le=8)
     anthropic_api_key: str = ""
     anthropic_base_url: str = "https://api.anthropic.com/v1"
     anthropic_model: str = "claude-sonnet-4-6"

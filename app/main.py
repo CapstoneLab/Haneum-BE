@@ -6,6 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api.router import api_router
+from app.api.routes.realtime import router as realtime_router
 from app.core.config import get_settings
 from app.core.errors import ApiError, api_error_handler, validation_error_handler
 
@@ -52,6 +53,7 @@ async def enforce_request_size(request: Request, call_next):
 
 
 app.include_router(api_router, prefix=settings.api_v1_prefix)
+app.include_router(realtime_router, prefix=settings.api_v1_prefix)
 
 
 @app.get("/", include_in_schema=False)

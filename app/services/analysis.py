@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from datetime import UTC, datetime
@@ -197,15 +198,22 @@ class AnalysisService:
         llm_data = None
         llm_error: LlmServiceError | None = None
         try:
-            llm_data = await self.llm.analyze(
-                LlmAnalyzeRequest(
-                    request_id=payload.request_id,
-                    input_text=masked_text,
-                    context_messages=masked_context,
-                    local_risk_types=payload.local_detection.risk_types,
-                    rule_risk_types=rule_result.risk_types,
+            async with asyncio.timeout(self.settings.llm_response_deadline_seconds):
+                llm_data = await self.llm.analyze(
+                    LlmAnalyzeRequest(
+                        request_id=payload.request_id,
+                        input_text=masked_text,
+                        context_messages=masked_context,
+                        local_risk_types=payload.local_detection.risk_types,
+                        rule_risk_types=rule_result.risk_types,
+                    )
                 )
+        except TimeoutError:
+            llm_error = LlmServiceError(
+                "LLM_DEADLINE_EXCEEDED",
+                "LLM analysis exceeded the realtime response deadline.",
             )
+            logger.warning("LLM deadline fallback for %s", payload.request_id)
         except LlmServiceError as exc:
             llm_error = exc
             logger.warning("LLM fallback for %s: %s", payload.request_id, exc.code)
@@ -312,3 +320,55 @@ class AnalysisService:
             logger.exception("Analysis succeeded but database write failed")
 
         return response
+
+    def analyze_provisional(self, payload: AnalyzeRequest) -> AnalyzeResponseData:
+        """Return a non-persistent local/rule result without waiting for external AI."""
+        started = time.perf_counter()
+        try:
+            verify_and_mask(payload.input_text, payload.masked_text)
+        except MaskingError as exc:
+            raise ApiError("MASKING_FAILED", str(exc), 422) from exc
+
+        rule_result = analyze_rules(payload.input_text, payload.context_messages)
+        risk_types = _merge_types(
+            payload.local_detection.risk_types,
+            rule_result.risk_types,
+        )
+        score_result = calculate_score(
+            local_score=payload.local_detection.local_score,
+            rule_score=rule_result.score,
+            llm_score=None,
+            llm_confidence=None,
+            risk_types=risk_types,
+            sensitivity="normal",
+        )
+        if rule_result.risk_types:
+            reason = rule_result.reason
+        elif payload.local_detection.risk_types:
+            reason = "A local risk signal was detected."
+        else:
+            reason = "No immediate risk signal was detected."
+
+        return AnalyzeResponseData(
+            request_id=payload.request_id,
+            risk_score=score_result.score,
+            risk_level=score_result.level,
+            risk_types=risk_types,
+            reason=reason[:150],
+            recommended_action=score_result.recommended_action,
+            analysis_source=AnalysisSource(
+                local_used=True,
+                rule_used=True,
+                llm_used=False,
+                fallback_used=False,
+            ),
+            conversation_risk=None,
+            scores=ScoreBreakdown(
+                local_score=payload.local_detection.local_score,
+                rule_score=rule_result.score,
+                llm_score=None,
+                llm_confidence=None,
+            ),
+            processing_time_ms=round((time.perf_counter() - started) * 1000),
+            server_timestamp=datetime.now(UTC),
+        )

@@ -1,8 +1,11 @@
+import asyncio
+import time
 import uuid
 from datetime import UTC, datetime
 
 import pytest
 
+from app.core.config import get_settings
 from app.schemas.analysis import LlmAnalyzeData, LlmModelInfo
 from app.services.llm import LlmClient, LlmServiceError
 
@@ -166,6 +169,30 @@ async def test_llm_failure_uses_rule_fallback(client, auth_headers, monkeypatch)
     assert data["analysis_source"]["llm_used"] is False
     assert data["analysis_source"]["fallback_used"] is True
     assert data["risk_level"] == "danger"
+
+
+async def test_analyze_returns_fallback_at_realtime_deadline(
+    client, auth_headers, monkeypatch
+) -> None:
+    async def slow_analyze(self, payload):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(LlmClient, "analyze", slow_analyze)
+    monkeypatch.setattr(get_settings(), "llm_response_deadline_seconds", 0.01)
+    request_id = uuid.uuid4()
+    started = time.perf_counter()
+
+    response = await client.post(
+        "/api/v1/analyze",
+        headers={**auth_headers, "X-Request-ID": str(request_id)},
+        json=_request_payload(request_id, dangerous=True),
+    )
+
+    assert response.status_code == 200
+    assert time.perf_counter() - started < 0.5
+    data = response.json()["data"]
+    assert data["analysis_source"]["llm_used"] is False
+    assert data["analysis_source"]["fallback_used"] is True
 
 
 async def test_conversation_risk_watches_confirms_and_stays_latched(
