@@ -125,3 +125,44 @@ def test_realtime_discards_final_result_for_superseded_draft(monkeypatch) -> Non
     assert provisional["sequence"] == 2
     assert final["type"] == "final_result"
     assert final["sequence"] == 2
+
+
+def test_realtime_reuses_cached_result_for_unchanged_draft(monkeypatch) -> None:
+    analyze_calls = 0
+
+    async def fake_analyze(self, payload):
+        nonlocal analyze_calls
+        analyze_calls += 1
+        return LlmAnalyzeData(
+            request_id=payload.request_id,
+            risk_score=10,
+            risk_types=[],
+            confidence=0.9,
+            reason="No risk.",
+            model=LlmModelInfo(name="test", version="1", runtime="test"),
+            processing_time_ms=10,
+        )
+
+    monkeypatch.setattr(LlmClient, "analyze", fake_analyze)
+    first = _draft_message(1)
+    second = _draft_message(2)
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/api/v1/realtime", headers={"X-API-Key": "test-android-api-key"}
+        ) as websocket:
+            websocket.send_json(first)
+            websocket.receive_json()
+            websocket.receive_json()
+
+            websocket.send_json(second)
+            provisional = websocket.receive_json()
+            final = websocket.receive_json()
+
+    assert analyze_calls == 1
+    assert provisional["type"] == "provisional_result"
+    assert provisional["sequence"] == 2
+    assert provisional["data"]["request_id"] == second["payload"]["request_id"]
+    assert final["type"] == "final_result"
+    assert final["sequence"] == 2
+    assert final["data"]["request_id"] == second["payload"]["request_id"]

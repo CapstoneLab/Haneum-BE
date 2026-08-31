@@ -8,6 +8,21 @@ with WebSocket code `1008`.
 
 ## Draft message
 
+Open the WebSocket when the keyboard becomes visible, but do not send every key
+event. The keyboard client should read the current composed text from its
+`InputConnection` and apply this transmission policy:
+
+- Send the latest draft after 1 second with no input (trailing-edge debounce).
+- While typing continues, send the latest draft at least once every 5 seconds
+  (maximum wait).
+- Do not send when the analysis inputs are unchanged from the previous send.
+- Run inexpensive on-device detection immediately; a local risk match may bypass
+  the debounce and be sent at once.
+
+For Korean input, send the IME-composed text such as `안녕하세요`, not individual
+jamo key events such as `ㅇ`, `ㅏ`, `ㄴ`. A new UUID is still required in
+`payload.request_id` for every draft that is actually sent.
+
 Send a new UUID in `payload.request_id` for every sequence.
 
 ```json
@@ -58,6 +73,11 @@ only if its sequence is still the latest accepted draft for that session.
 The server keeps at most one waiting draft per WebSocket connection. If input
 arrives faster than final analysis, the waiting draft is replaced by the newest
 one. The in-flight result is persisted but not sent when it has become stale.
+
+Within a connection and session, equivalent consecutive drafts reuse the most
+recent provisional/final result instead of running rule and AI analysis again.
+The cache identity excludes `request_id` and `client_timestamp`, uses a SHA-256
+digest rather than raw text as its key, and is discarded when the WebSocket closes.
 
 ## Deadline
 

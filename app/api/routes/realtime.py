@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import secrets
 from contextlib import suppress
@@ -36,6 +38,23 @@ def _run_final_analysis(message: RealtimeDraftMessage) -> AnalyzeResponseData:
     return asyncio.run(run())
 
 
+def _analysis_signature(message: RealtimeDraftMessage) -> str:
+    """Hash analysis inputs while ignoring per-send metadata."""
+
+    payload = message.payload.model_dump(
+        mode="json",
+        exclude={"request_id", "client_timestamp"},
+    )
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _for_request(result: AnalyzeResponseData, message: RealtimeDraftMessage) -> AnalyzeResponseData:
+    """Reuse an analysis result with the request id of the latest equivalent draft."""
+
+    return result.model_copy(update={"request_id": message.payload.request_id})
+
+
 @router.websocket("/realtime")
 async def realtime_analysis(websocket: WebSocket) -> None:
     settings = get_settings()
@@ -50,6 +69,10 @@ async def realtime_analysis(websocket: WebSocket) -> None:
     send_lock = asyncio.Lock()
     queue: asyncio.Queue[RealtimeDraftMessage] = asyncio.Queue(maxsize=1)
     latest: dict[str, int] = {}
+    latest_message: dict[str, RealtimeDraftMessage] = {}
+    latest_signature: dict[str, str] = {}
+    provisional_cache: dict[str, tuple[str, AnalyzeResponseData]] = {}
+    final_cache: dict[str, tuple[str, AnalyzeResponseData]] = {}
 
     async def send_error(
         code: str,
@@ -74,15 +97,18 @@ async def realtime_analysis(websocket: WebSocket) -> None:
             message = await queue.get()
             try:
                 result = await asyncio.to_thread(_run_final_analysis, message)
-                if latest.get(message.session_id) == message.sequence:
+                signature = _analysis_signature(message)
+                final_cache[message.session_id] = (signature, result)
+                current = latest_message.get(message.session_id)
+                if current is not None and latest_signature.get(message.session_id) == signature:
                     await _send_event(
                         websocket,
                         send_lock,
                         RealtimeAnalysisEvent(
                             type="final_result",
-                            session_id=message.session_id,
-                            sequence=message.sequence,
-                            data=result,
+                            session_id=current.session_id,
+                            sequence=current.sequence,
+                            data=_for_request(result, current),
                         ),
                     )
             except ApiError as exc:
@@ -122,6 +148,40 @@ async def realtime_analysis(websocket: WebSocket) -> None:
                 )
                 continue
 
+            signature = _analysis_signature(message)
+            cached_provisional = provisional_cache.get(message.session_id)
+            if (
+                latest_signature.get(message.session_id) == signature
+                and cached_provisional is not None
+                and cached_provisional[0] == signature
+            ):
+                latest[message.session_id] = message.sequence
+                latest_message[message.session_id] = message
+                await _send_event(
+                    websocket,
+                    send_lock,
+                    RealtimeAnalysisEvent(
+                        type="provisional_result",
+                        session_id=message.session_id,
+                        sequence=message.sequence,
+                        data=_for_request(cached_provisional[1], message),
+                    ),
+                )
+
+                cached_final = final_cache.get(message.session_id)
+                if cached_final is not None and cached_final[0] == signature:
+                    await _send_event(
+                        websocket,
+                        send_lock,
+                        RealtimeAnalysisEvent(
+                            type="final_result",
+                            session_id=message.session_id,
+                            sequence=message.sequence,
+                            data=_for_request(cached_final[1], message),
+                        ),
+                    )
+                continue
+
             try:
                 with SessionLocal() as db:
                     provisional = AnalysisService(db, settings).analyze_provisional(
@@ -137,6 +197,9 @@ async def realtime_analysis(websocket: WebSocket) -> None:
                 continue
 
             latest[message.session_id] = message.sequence
+            latest_message[message.session_id] = message
+            latest_signature[message.session_id] = signature
+            provisional_cache[message.session_id] = (signature, provisional)
             await _send_event(
                 websocket,
                 send_lock,
